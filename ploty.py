@@ -114,21 +114,14 @@ def plot_acc(
     Debug=False
 ):
     T = len(results[policy_list[0]]["acc_train"])
-    
+    target_acc = 0.3
     npolicy = len(policy_list)
-    # policy_list = ["uniform", "POC", "CBS", "KL"]
-    # policy_list = ["POC", "CBS", "KL"]
     style_list = ["b-", "r-", "y-", "g-", "m-"]
     label_list = policy_list
-    # label_list = ["FedAvg", "Power-of-choice", "Fed-CBS", "FedQS (ours)"]
-    # label_list = ["FedAvg+Balanced Loss", "FedQS", "FedQS+Balanced Loss"]
-    # label_list = ["Power-of-choice", "Fed-CBS", "FedQS (ours)"]
     linew = 0.8
     plt.figure(figsize=(10, 6))
     plt.grid()
-    # print(T)
     for idx, policy in enumerate(policy_list):
-        # print(T, policy)
         plt.plot(
             np.linspace(0, T, T), results[policy]["acc_test"][:T], style_list[idx], linewidth=linew, label=label_list[idx]
         )
@@ -254,7 +247,7 @@ def csprofile(client_cnt, N, m, T):
     limit = (m/N)
     plt.figure()
     plt.axvline(x = limit, color = 'r', linestyle = "--", label = 'participation rate lower bound')
-    binwidth = 0.01
+    binwidth = 0.0005
     print(T)
     data = client_cnt
     print(len([x for x in data if x > limit]))
@@ -430,22 +423,22 @@ def plot_shift(res_dict, policy_list):
     plt.show()
 
 def get_metric_ovr():
-    seed_list = [0, 1, 2, 3, 4]
+    seed_list = [0, 1, 2]
     Nseed = len(seed_list)
     # subdir = "Tinyimagenet_test"
     # dataset = "Tinyimagenet"
     # alpha = "alpha005"
     # version = "test"
 
-    subdir = "CIFAR100_test"
+    subdir = "CIFAR100_hypertune"
     dataset = "CIFAR100"
-    alpha = "alpha03"
-    version = "test"
+    alpha = "alpha01"
+    version = "v1"
 
     print(f"Plotting results from {dataset} with version:{version} and alpha: {alpha}")
 
     V_list = [1, 2, 5, 10, 20, 50, 100, 200]
-    alpha_list = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    lambda_list = [0.1, 1, 10, 100]
     # alpha_list = [0.825, 0.875]
     
     policy_list = ["balanced", "POC_balanced", f"KL_balanced_V20_R0125_maxlim"]
@@ -455,7 +448,7 @@ def get_metric_ovr():
 
 
     # policy_list = [f"KL_balanced_V{v_val}_R1_maxlim" for v_val in V_list]
-    # policy_list = [f"CBS_balanced_alpha{alpha}" for alpha in alpha_list]
+    policy_list = [f"CBS_balanced_lambda{expfactor}" for expfactor in lambda_list]
 
     # policy_list = ["uniform", "POC", "CBS", f"KL_V50_R025_maxlim"]
     # policy_list = [f"KL_balanced_V100_R05_diminish16v2"]
@@ -505,25 +498,25 @@ def get_metric_ovr():
 
 
 def main():
-    N = 100
+    N = 5000
     K = 100
-    m = 10
+    m = 5
 
-    subdir = "Tinyimagenet_FedCBS_hypertune"
-    dataset = "Tinyimagenet"
+    subdir = "CIFAR100_hypertune"
+    dataset = "CIFAR100"
     alpha = "alpha01"
-    version = "val"
+    version = "v1"
 
     KL_name= "KL_balanced_V50_R025_maxlim"
     policy_list = ["balanced", "POC_balanced", "CBS_balanced", KL_name]
     # policy_list = ["uniform", "POC", "CBS", f"KL_V50_R025_maxlim"]
 
-    policy_list = [f"CBS_balanced_alpha0.7"]
+    policy_list = [f"CBS_balanced_lambda0.1"]
     # policy_list = ["balanced"]
     res_dict = {}
     
     for policy in policy_list:
-        with open(f"results/{subdir}/{dataset}_{alpha}_{version}_S9_{policy}.json", "r") as infile:
+        with open(f"results/{subdir}/{dataset}_{alpha}_{version}_S0_{policy}.json", "r") as infile:
             result = json.load(infile)
             res_dict[policy] = {"loss_train":[], "loss_test":[], "acc_train":[], "acc_test":[], "client_cnt":[], "f1_test":[]}
             for i, metric in enumerate(res_dict[policy]):
@@ -531,7 +524,7 @@ def main():
     
     T = len(res_dict[policy_list[0]]["acc_test"])
     get_metric_ovr()
-    # plot_acc(res_dict, policy_list, showtrain=False, Debug=True)
+    plot_acc(res_dict, policy_list, showtrain=False, Debug=True)
     # plot_f1(res_dict, policy_list)
     # plot_distribution(res_dict, policy_list=[KL_name, KL_name2])
     csprofile(res_dict[policy_list[0]]["client_cnt"], N, m, T)

@@ -82,7 +82,7 @@ def FedAvg(policy, rseed, Debug=True):
     if len(gpus) > 0:
         tf.config.set_logical_device_configuration(
         gpus[0],
-        [tf.config.LogicalDeviceConfiguration(memory_limit=1024*4)])
+        [tf.config.LogicalDeviceConfiguration(memory_limit=1024*6)])
     Aq = np.zeros(N)
     Bq = 0
     Yq = np.zeros(N)
