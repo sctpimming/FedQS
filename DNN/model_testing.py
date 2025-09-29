@@ -1,72 +1,98 @@
-import os
-
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
-
-import sys
-sys.path.append('code')
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
-
-
-import numpy as np
 import tensorflow as tf
-import keras
-from keras import backend as bkd
-from sklearn.metrics import f1_score
-from PIL import Image
-import gc
-
-
-
-import pickle
-from tqdm import tqdm
+from tensorflow import keras
+from tensorflow.keras.layers import GroupNormalization, BatchNormalization
 import models
+import numpy as np
 
-def import_data(v):
-    train_path = f"data/Federated/iNat_train.pck"
-    test_path = f"data/Federated/iNat_train.pck"
-    with open(train_path, "rb") as f:
-        train_data = pickle.load(f)
-    with open(test_path, "rb") as f:
-        test_data = pickle.load(f)
-    return train_data, test_data
 
-def init(v):    
-    global train_data
-    global test_data
-    train_data, test_data = import_data(v)
+# Assuming your get_MobileNet function is already defined
+# (it should include the replace_batchnorm_with_groupnorm logic)
 
-def get_img(file_path):
-    img = Image.open(file_path)
-    if img.mode == 'CMYK':
-        img = img.convert('RGB')
-    img = np.array(img)/255.0
-    if img.shape[-1] == 4:
-        print(file_path)
-    img = tf.convert_to_tensor(img)
-    if img.ndim < 3:
-        img = tf.image.grayscale_to_rgb(tf.expand_dims(img, -1))
-    img = tf.image.resize(img, size=(224, 224))
-    return img
+# Create the original model with BatchNormalization
+bn_model = models.get_MobileNet(K=1000, IsGN=False)
 
-def get_batch(x, y, batch_size=50):
-    batch_idx = np.random.choice(len(y), batch_size) 
-    x_batch = tf.convert_to_tensor([get_img(x[idx]) for idx in batch_idx])
-    y_batch = tf.convert_to_tensor([y[idx] for idx in batch_idx])
-    return x_batch, y_batch
+# Create the modified model with GroupNormalization
+gn_model = models.get_MobileNet(K=1000, IsGN=True, group_sz=2)
 
-init("v1")
-global_model = keras.models.load_model('iNat_QS_checkpoint.keras')
-user_name = [v for v in train_data["users"]]
+print("Layer-by-Layer Comparison of BatchNormalization vs. GroupNormalization Models\n")
+print(f"{'Layer Name':<40} | {'BN Layer Type':<20} | {'GN Layer Type':<20}")
+print("-" * 85)
 
-for n in range(len(user_name)):
-    x_test = test_data["user_data"][user_name[n]]["x"]
-    y_test = test_data["user_data"][user_name[n]]["y"]
+# The models have the same number of layers and a similar structure.
+# We can iterate through them and compare corresponding layers.
+for i in range(len(bn_model.layers)):
+    bn_layer = bn_model.layers[i]
+    gn_layer = gn_model.layers[i]
+    
+    # Check if the layers are of different types, which is what we expect
+    # for normalization layers.
+    if type(bn_layer) != type(gn_layer):
+        # We've found a difference! Let's check if it's a normalization layer.
+        if isinstance(bn_layer, BatchNormalization) and isinstance(gn_layer, GroupNormalization):
+            print(f"{bn_layer.name:<40} | {type(bn_layer).__name__:<20} | {type(gn_layer).__name__:<20}  ✅")
+        else:
+            # If there's an unexpected difference, print it as an error.
+            print(f"{bn_layer.name:<40} | {type(bn_layer).__name__:<20} | {type(gn_layer).__name__:<20}  ❌ UNEXPECTED DIFFERENCE")
+    else:
+        # If the layers are the same type, just print them for context.
+        print(f"{bn_layer.name:<40} | {type(bn_layer).__name__:<20} | {type(gn_layer).__name__:<20}")
 
-    test_batch_sz = 32
-    x_test_batch, y_test_batch = get_batch(x_test, y_test, batch_size=test_batch_sz)
-    test_scores = global_model.evaluate(x_test_batch, y_test_batch, verbose=0, batch_size=test_batch_sz)
-    # predictions = global_model.predict(x_test_batch)
-    print(test_scores)
-    # print([((-predictions[i]).argsort()[:5], y_test_batch[i]) for i in range(test_batch_sz)])
+print("\n--- Summary of Differences ---")
+
+# Count the number of normalization layers replaced
+bn_norm_count = sum(1 for layer in bn_model.layers if isinstance(layer, BatchNormalization))
+gn_norm_count = sum(1 for layer in gn_model.layers if isinstance(layer, GroupNormalization))
+
+print(f"Original model had {bn_norm_count} BatchNormalization layers.")
+print(f"Modified model has {gn_norm_count} GroupNormalization layers.")
+
+# Compare total parameter counts
+bn_params = bn_model.count_params()
+gn_params = gn_model.count_params()
+
+print(f"\nTotal parameters in original (BN) model: {bn_params}")
+print(f"Total parameters in modified (GN) model: {gn_params}")
+print(f"Difference in parameters: {bn_params - gn_params}")
+
+print("Verifying weights for non-normalization layers:")
+print("-" * 50)
+
+for i in range(len(bn_model.layers)):
+    bn_layer = bn_model.layers[i]
+    gn_layer = gn_model.layers[i]
+
+    # Skip normalization layers as their weights are intentionally different
+    if not isinstance(bn_layer, (BatchNormalization, GroupNormalization)):
+        bn_weights = bn_layer.get_weights()
+        gn_weights = gn_layer.get_weights()
+        
+        # Check if weights exist for both layers
+        if bn_weights and gn_weights:
+            # Use numpy.array_equal to check for element-wise equality
+            weights_match = all(np.array_equal(w1, w2) for w1, w2 in zip(bn_weights, gn_weights))
+            if weights_match:
+                print(f"✅ Weights match for layer: {bn_layer.name}")
+            else:
+                print(f"❌ Weights DO NOT match for layer: {bn_layer.name}")
+        else:
+            # Handle layers with no weights (e.g., Activation layers)
+            print(f"--- No weights to compare for layer: {bn_layer.name}")
+
+random_input = tf.random.normal(shape=(1, 224, 224, 3))
+
+# Get the output from both models
+bn_output = bn_model(random_input)
+gn_output = gn_model(random_input)
+
+# Calculate the mean squared difference between the outputs
+difference = np.mean(np.square(bn_output - gn_output))
+
+print("\nVerifying layer connections by comparing model outputs:")
+print("-" * 50)
+print(f"Mean Squared Difference between BN and GN model outputs: {difference:.8f}")
+
+# A small, non-zero difference is expected and a good sign.
+# A difference of 0 would mean the GroupNormalization layer isn't doing anything,
+# while a very large difference might indicate a structural issue.
+# The expected difference is small because most of the weights are the same,
+# but the normalization is different.

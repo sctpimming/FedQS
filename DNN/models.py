@@ -1,50 +1,119 @@
-import keras
-from keras import layers
 import tensorflow as tf
+from keras import layers, Model
+from keras.layers import Layer, Input, InputLayer, GroupNormalization, BatchNormalization
+import keras
 # import tensorflow_addons as tfa
 import numpy as np
 import mobilenet_v2
 from pgd import PerturbedGradientDescent
 from keras.optimizers import Optimizer
 import keras.backend as K
+from collections import deque
+import gc
+
+import tensorflow as tf
+from tensorflow.keras.layers import Layer, BatchNormalization, GroupNormalization, Input
+from tensorflow.keras import Model, initializers
+from tensorflow.keras.backend import int_shape
+
+def replace_batchnorm_with_groupnorm(original_model, groups_sz=None, group_num=None):
+    new_layers = {}
+    input_tensor = Input(tensor=original_model.input, name=original_model.input.name)
+    tensor_map = {original_model.input.ref(): input_tensor}
+    
+    for layer in original_model.layers:
+        if isinstance(layer, InputLayer):
+            continue
+
+        input_tensors = []
+        if isinstance(layer.input, (list, tuple)):
+            for t in layer.input:
+                input_tensors.append(tensor_map[t.ref()])
+        else:
+            input_tensors = tensor_map[layer.input.ref()]
+
+        if isinstance(layer, BatchNormalization):
+            num_channels = int_shape(input_tensors)[-1]
+            
+            if groups_sz is not None:
+                current_groups = num_channels // groups_sz
+            elif group_num is not None:
+                current_groups = group_num
+            else:
+                # Default to 32 groups if no size is specified
+                current_groups = num_channels
+            
+            is_last_bn_in_block = 'add' in original_model.layers[original_model.layers.index(layer) + 1].name
+
+            if is_last_bn_in_block:
+                gamma_initializer = initializers.Zeros() 
+            else:
+                gamma_initializer = initializers.Ones()
+
+            new_layer = GroupNormalization(
+                groups=current_groups,
+                name=layer.name,
+                epsilon=layer.epsilon,
+                gamma_initializer=gamma_initializer
+            )
+            new_output_tensor = new_layer(input_tensors)
+
+        else:
+            config = layer.get_config()
+            new_layer = layer.__class__(**config)
+            
+            # Call the new layer on the input tensor to build it
+            new_output_tensor = new_layer(input_tensors)
+            
+            # Now that the layer is built, we can safely set the weights
+            if layer.get_weights():
+                new_layer.set_weights(layer.get_weights())
+
+        tensor_map[layer.output.ref()] = new_output_tensor
+        new_layers[layer.name] = new_layer
+
+    new_model = Model(inputs=input_tensor, outputs=new_output_tensor)
+    return new_model
+
+def check_replace_batchnorm(original_model):
+    new_layers = {}
+    input_tensor = Input(tensor=original_model.input, name=original_model.input.name)
+    tensor_map = {original_model.input.ref(): input_tensor}
+
+    for layer in original_model.layers:
+        if isinstance(layer, InputLayer):
+            continue
+
+        input_tensors = []
+        if isinstance(layer.input, (list, tuple)):
+            for t in layer.input:
+                input_tensors.append(tensor_map[t.ref()])
+        else:
+            input_tensors = tensor_map[layer.input.ref()]
+
+        if isinstance(layer, BatchNormalization):
+            # For sanity check, replace with a NEW BatchNormalization layer
+            new_layer = BatchNormalization(
+                name=layer.name,
+                epsilon=layer.epsilon,
+                axis=layer.axis
+            )
+            new_output_tensor = new_layer(input_tensors)
+
+        else:
+            config = layer.get_config()
+            new_layer = layer.__class__(**config)
+            new_output_tensor = new_layer(input_tensors)
+            if layer.get_weights():
+                new_layer.set_weights(layer.get_weights())
+
+        tensor_map[layer.output.ref()] = new_output_tensor
+        new_layers[layer.name] = new_layer
+
+    new_model = Model(inputs=input_tensor, outputs=new_output_tensor)
+    return new_model
 
 
-
-class ProximalSGD(Optimizer):
-    def __init__(self, learning_rate=0.01, l1_lambda=0.01, **kwargs):
-        super(ProximalSGD, self).__init__(name="ProximalSGD", **kwargs)
-        self.learning_rate = learning_rate  # Learning rate as a float
-        self.l1_lambda = l1_lambda  # Regularization parameter for L1 regularization
-
-    def _create_slots(self, var_list):
-        # No slots needed since momentum is removed
-        pass
-
-    def _resource_apply_dense(self, grad, var, apply_state=None):
-        # Apply the standard SGD update
-        var.assign_sub(self.learning_rate * grad)  # Directly use the learning rate
-
-        # Apply the proximal operator (L1 regularization)
-        var.assign(self.proximal_operator(var))
-
-    def proximal_operator(self, var):
-        """Apply the proximal operator for L1 regularization."""
-        return tf.sign(var) * tf.maximum(tf.abs(var) - self.l1_lambda, 0)
-
-    def set_learning_rate(self, new_learning_rate):
-        """Update the learning rate."""
-        self.learning_rate = new_learning_rate
-
-    def get_config(self):
-        config = super(ProximalSGD, self).get_config()
-        config.update({
-            "learning_rate": self.learning_rate,
-            "l1_lambda": self.l1_lambda,
-        })
-        return config
-
-
-# Get a "l2 norm of gradients" tensor
 def get_gradient_norm(model):
     with K.name_scope('gradient_norm'):
         grads = K.gradients(model.total_loss, model.trainable_weights)
@@ -93,7 +162,6 @@ def get_ChoNet(img_shape = (32, 32, 3), config="None"):
     )
     return model
 
-
 def get_CNNmodel(img_shape = (32, 32, 3), config="None"):
     model = keras.Sequential()
     model.add(layers.Conv2D(6, (5, 5), activation="relu", input_shape=img_shape))
@@ -114,7 +182,7 @@ def get_CNNmodel(img_shape = (32, 32, 3), config="None"):
 
     return model
 
-def get_LeNet(K=100, input_shape=(32, 32, 3), config="None", weight=None):
+def get_LeNet(K=100, input_shape=(32, 32, 3), config="None", weight=None, learning_rate=0.01):
     model = keras.Sequential()
     model.add(layers.Conv2D(64, (5, 5), activation="relu", input_shape=input_shape))
     model.add(layers.MaxPooling2D((2, 2)))
@@ -138,7 +206,7 @@ def get_LeNet(K=100, input_shape=(32, 32, 3), config="None", weight=None):
     else:
         model.compile(
             loss=keras.losses.SparseCategoricalCrossentropy(),
-            optimizer=keras.optimizers.SGD(weight_decay=0.00004),
+            optimizer=keras.optimizers.SGD(weight_decay=0.00004, learning_rate=learning_rate),
             metrics=[keras.metrics.SparseCategoricalAccuracy()],
         )
     # model.metrics_names.append("gradient_norm")
@@ -147,51 +215,42 @@ def get_LeNet(K=100, input_shape=(32, 32, 3), config="None", weight=None):
     return model
 
 
-def get_MobileNet(K=1203, input_shape=(224, 224, 3), config="None", weight=None):
-    inputs = tf.keras.Input(shape=input_shape)
+def get_MobileNet(K=1203, input_shape=(224, 224, 3), IsGN=False, learning_rate=0.01, group_sz=None, group_num=None):
+    # Ensure the input shape is correct for MobileNetV2
     base_model = keras.applications.MobileNetV2(
         input_shape=input_shape,
         include_top=False,
         weights="imagenet",
-        # pooling="max",
+        pooling="avg",
     )
-    # base_model.summary()
-    # layers_list = [l for l in base_model.layers]
-    # Mobile_GN = insert_layer_nonseq(base_model, '.*BN.*', GN_factory)
-    # Mobile_GN.save('temp.h5')
-    # Mobile_GN = keras.models.load_model('temp.h5')
-    # Mobile_GN.summary()
-    x = base_model(inputs)
+
+    
+    # This is the correct logic for Group Normalization
+    if IsGN:
+        base_model = replace_batchnorm_with_groupnorm(base_model, groups_sz=group_sz, group_num=group_num)
+
+    # Get the output of the base model
+    x = base_model.output
+    
+    # Add the final classification layer
     fc2 = layers.Dense(K, activation="softmax")
     outputs = fc2(x)
-    # print(x.shape)
-    # x = tf.keras.layers.AveragePooling2D(7)(x)
-    # x = tf.keras.layers.Conv2D(K, (1, 1), padding='same')(x)
-    # x = tf.keras.layers.Reshape((K,), name='output')(x)
-    # outputs = tf.keras.layers.Activation('softmax', name='final_activation')(x)
     
-    model = tf.keras.Model(inputs, outputs)
+    # Build the complete model with the base model's input and new output
+    model = tf.keras.Model(inputs=base_model.input, outputs=outputs)
     
-    #model.summary()
-    # for name in layers_name:
-    #     print(name, base_model.get_layer(name))
-    # print(layers_name)
-    if config == "prox":
-        # optimizer = tfa.optimizers.ProximalAdagrad(learning_rate=0.01, l2_regularization_strength=0.1)
-        optimizer = keras.optimizers.SGD(weight_decay=0.00004)
-        model.compile(optimizer=optimizer,
-              loss=tf.keras.losses.sparse_categorical_crossentropy,
-              metrics=[tf.keras.metrics.sparse_categorical_accuracy])
-    else:
-        model.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(),
-            optimizer=keras.optimizers.SGD(weight_decay=0.00004),
-            metrics=[keras.metrics.SparseCategoricalAccuracy()],
-        )
+    
+    # Compile the model with the specified optimizer and metrics
+    model.compile(
+        loss=keras.losses.SparseCategoricalCrossentropy(),
+        optimizer=keras.optimizers.SGD(weight_decay=0.0005, learning_rate=learning_rate),
+        metrics=[keras.metrics.SparseCategoricalAccuracy()],
+    )
 
     return model
 
-def get_ResNet50(weight_config=None, K=200):
+def get_ResNet50(weight_config=None, K=200, rseed=0):
+    tf.random.set_seed(int(rseed))
     inputs = tf.keras.Input(shape=(64, 64, 3))
 
     base_model = keras.applications.ResNet50(
@@ -211,12 +270,14 @@ def get_ResNet50(weight_config=None, K=200):
     outputs = predict(x)
 
     model = tf.keras.Model(inputs, outputs)
-    model.summary()
+    # model.summary()
     model.compile(
         loss=keras.losses.SparseCategoricalCrossentropy(),
         optimizer=keras.optimizers.SGD(weight_decay=1e-5, momentum=0.9),
         metrics=[keras.metrics.SparseCategoricalAccuracy()],
     )
     return model
+
+
 
 # model = get_ChoNet()

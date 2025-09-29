@@ -31,7 +31,6 @@ import models
 from util.misc import KL
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
-seed_list = list(range(5))
 
 N = 5000
 r = int(N * 0.3)
@@ -39,31 +38,42 @@ m = 5
 B = 50
 I = 5
 K = 100
-T = 5000
+T = 1000
 
 dataset = "CIFAR100"
-alpha = "alpha01"
-v = "v1"
+train_group = "G3"
+test_group = "G4"
+v = "val3"
 
-seed_list = [0, 1, 2]
-run_list = ["control"]
-policy_list = ["uniform", "CBS"]
+if dataset == "CIFAR":
+    K = 10
+elif dataset == "CIFAR100":
+    K = 100
+elif dataset == "Tinyimagenet":
+    K = 200
+
+seed_list = [0]
+run_list = np.linspace(10, 50, 9, endpoint=False)
+run_list = run_list[1:]
+print(run_list)
 nworkers = 2
+run_list = np.array(run_list).reshape(-1, nworkers)/1
+policy = "KL_balanced"
 
 
-def import_data(v):
-    train_path = f"data/Federated/CIFAR100_alpha01_{v}_train.pck"
-    test_path = f"data/Federated/CIFAR100_alpha01_{v}_test.pck"
+def import_data(v, seed):
+    train_path = f"data/Federated/{dataset}_train{train_group}_test{test_group}_{v}_train.pck"
+    test_path = f"data/Federated/{dataset}_train{train_group}_test{test_group}_{v}_test.pck"
     with open(train_path, "rb") as f:
         train_data = pickle.load(f)
     with open(test_path, "rb") as f:
         test_data = pickle.load(f)
     return train_data, test_data
 
-def init(v):   
+def init(v, seed):   
     global train_data
     global test_data
-    train_data, test_data = import_data(v)
+    train_data, test_data = import_data(v, seed)
 
 def client_train(model, x_train, y_train, stepsize, max_steps, weight=None):
     model.optimizer.learning_rate.assign(stepsize)
@@ -79,14 +89,29 @@ def client_train(model, x_train, y_train, stepsize, max_steps, weight=None):
     )
     return history, model
 
-def FedAvg(policy, param, rseed, Debug=True):
+def FedAvg(policy, param, rseed, Debug=True, early_stopping=True):
     gpus = tf.config.list_physical_devices('GPU')
-    print(f"Algorithm: {policy} param val:{param} Random Seed: {rseed}")
+    print(f"Algorithm: {policy} param val:{param} Random Seed: {rseed} Early Stopping: {early_stopping}")
     np.random.seed(rseed)
     if len(gpus) > 0:
-        tf.config.set_logical_device_configuration(
-        gpus[0],
-        [tf.config.LogicalDeviceConfiguration(memory_limit=1024*4)])
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+    
+    if "KL" in policy:
+        policy_name = f"{policy}_V{param}"
+    elif "CBS" in policy:
+        policy_name = f"{policy}_lambda{param}"
+    else:
+        policy_name = policy
+
+    
+    best_accuracy = 0.00
+    wait = 0
+    patience = 100
+    min_delta = 0.0005
+
+    decay_rate = 0.9992
+    stepsize = 0.01
+
     Aq = np.zeros(N)
     Yq = np.zeros(N)
     Zq = np.zeros(N)
@@ -109,19 +134,28 @@ def FedAvg(policy, param, rseed, Debug=True):
     )
     nsample_train = [train_data["num_samples"][n] for n in range(N)]
     max_steps = int(max(nsample_train)/B) * I
+    print(f"Training with {max_steps} steps")
     sumsz_train = sum(nsample_train)
     szfrac_train = np.array(
         [train_data["num_samples"][n] / sumsz_train for n in range(N)]
     )
+
+    train_dist = np.array(
+        [train_data["distribution"][uname] for uname in train_data["distribution"]]
+    )
+
+
     test_dist = np.array(test_data["distribution"]["test"])
-    Q_inv = np.array([1/q if q > 0 else 10 ** (-20) for q in test_dist])
+    uni_dist = np.array([1/K]*K)
+    # test_dist = uni_dist
+
+    client_weight = np.array([0.5/N for n in range(N)])
+
+    # client_weight = client_weight/np.sum(client_weight)
 
     x_test = tf.convert_to_tensor(test_data["user_data"]["test"]["x"])
     y_test = tf.convert_to_tensor(test_data["user_data"]["test"]["y"])
-    test_batch_sz = 512
-
-    decay_rate = 0.9992
-    stepsize = 0.01
+    test_batch_sz = B
 
     if policy == "Fedprox":
         global_model = models.get_LeNet(config="prox")
@@ -135,9 +169,7 @@ def FedAvg(policy, param, rseed, Debug=True):
         loss_train[t] = sum(client_loss_train[masked])/max(sum(masked), 1)
         acc_train[t] = np.dot(client_acc_train, szfrac_train)
 
-
-        available_client = np.random.choice(N, r, replace=False, p=szfrac_train)
-
+        available_client = np.random.choice(N, r, replace=False)
 
         if "uniform" in policy:
             participants_set = client_sample_uni(available_client, m)
@@ -145,14 +177,13 @@ def FedAvg(policy, param, rseed, Debug=True):
             participants_set = client_sample_POC(available_client, m, client_loss_train)
         elif "CBS" in policy:
             participants_set = client_sample_CBS(
-                train_dist, available_client, m, nsample_train, t, client_cnt + 1, expfactor=10
+                train_dist, available_client, m, nsample_train, t, client_cnt + 1, expfactor=param
             )
         elif "KL" in policy:
             participants_set, Aq, Yq, Zq = client_sample_KL(
-                train_dist, test_dist, available_client, m, nsample_train,
-                Aq, Yq, Zq, Q_inv, 
-                V=100, R=(m/N)*0.5, 
-                max_rate_lim=True, diminish=False
+                train_dist, test_dist, available_client, m, client_weight,
+                Aq, Yq, Zq,
+                V=param, min_rate_lim=True, max_rate_lim=True
             )
 
         weights = []
@@ -212,46 +243,62 @@ def FedAvg(policy, param, rseed, Debug=True):
         shift_test[t] = KL(test_dist, policy_dist)
 
         if Debug:
-            print(f'{policy}V{param}: train loss:{loss_train[t]:.4f}, train acc: {acc_train[t]:.4f}, test loss: {loss_test[t]:.4f}, test acc: {acc_test[t]:.4f}, test macro f1: {f1_test[t]:.4f}, gradient norm: {gradient_norm[t]:.4f}')
+            print(f'{policy_name}: train loss:{loss_train[t]:.4f}, train acc: {acc_train[t]:.4f}, test loss: {loss_test[t]:.4f}, test acc: {acc_test[t]:.4f}, test macro f1: {f1_test[t]:.4f}, sumrate: {sum(client_cnt)}')
+        
+        train_log = {
+            'epoch': t,
+            'loss_train': list(loss_train),
+            'loss_test':list(loss_test),
+            'acc_train': list(acc_train),
+            'acc_test': list(acc_test),        
+            'client_cnt': list(client_cnt),
+            'f1_test': list(f1_test),
+            'shift': list(shift_test),
+            'Aq' : list(Aq),
+            'Yq' : list(Yq),
+            'Zq' : list(Zq),
+            'client_loss_train' : list(client_loss_train),
+            'client_acc_train' : list(client_acc_train),
+            'best_accuracy' : best_accuracy,
+            'stepsize': stepsize,
+            'policy_name': policy_name
+        }
+            
+        if early_stopping:
+            if acc_test[t] - best_accuracy > min_delta:
+                best_accuracy = acc_test[t]
+                wait = 0  # Reset counter when improvement is significant
+            else:
+                wait += 1  # No significant improvement, increment counter
 
-
+            # Trigger early stopping if no improvement for a set number of rounds
+            if wait >= patience:
+                print(f"\nEarly stopping triggered after {t + 1} rounds!")
+                break  # Stop training
+        
+                
         stepsize = stepsize * decay_rate
         bkd.clear_session()
 
-    del global_model
+    del global_model, y_pred, model_pred
     gc.collect()
     bkd.clear_session()
 
-    return (
-        list(loss_train),
-        list(loss_test),
-        list(acc_train),
-        list(acc_test),
-        list(client_cnt / T),
-        list(f1_test),
-        list(shift_test),
-        param
-    )
+    return train_log
 
 
 def main():
-    for V_list in run_list:
-        print(f"Running version {v} with V = {V_list} and seed = {seed_list}")
-        
+    for param_list in run_list:
+        print(f"Running version {v} with V = {param_list} and seed = {seed_list}")
         for rseed in seed_list:
-            with concurrent.futures.ProcessPoolExecutor(initializer=init, initargs=(v, ), max_workers=nworkers, mp_context=multiprocessing.get_context("fork")) as executor:
-                futures = [executor.submit(FedAvg, "CBS_balanced", V, rseed) for V in V_list]
+            with concurrent.futures.ProcessPoolExecutor(initializer=init, initargs=(v, rseed), max_workers=nworkers, mp_context=multiprocessing.get_context("fork")) as executor:
+                futures = [executor.submit(FedAvg, policy, param, rseed, True, False) for param in param_list]
                 for future in concurrent.futures.as_completed(futures):
                     results = future.result()
-                    V = results[-1]
-                    policy_name = f"CBS_balanced_lambda{V}"
-                    results = results[:-1]
-                    print(f"\n {policy_name} completed")
-                    res_dict= {"loss_train":[], "loss_test":[], "acc_train":[], "acc_test":[], "client_cnt":[], "f1_test":[], "shift":[]}
-                    for i, metric in enumerate(res_dict):
-                        res_dict[metric] = results[i]
-                    with open(f"results/CIFAR100_hypertune/CIFAR100_alpha01_{v}_S{rseed}_{policy_name}.json", "w") as f:
-                        json.dump(res_dict, f)  
+                    policy_name = results.pop("policy_name")
+                    print(f"{policy_name} completed")
+                    with open(f"results/{dataset}_hypertune/{dataset}_train{train_group}_test{test_group}_{v}_{policy_name}.json", "w") as f:
+                        json.dump(results, f)   
 
 
 if __name__ == "__main__":
